@@ -33,7 +33,9 @@ import Cryptol.ModuleSystem.Name (asPrim)
 import Cryptol.Utils.Ident (Ident,mkIdent)
 import Cryptol.Utils.PP
 
+import qualified Data.Foldable as Fold
 import Data.List (sortBy)
+import qualified Data.Sequence as Seq
 import Data.Ord (comparing)
 import Data.Bits (Bits(..))
 
@@ -101,13 +103,13 @@ primTable = Map.fromList $ map (\(n, v) -> (mkIdent (T.pack n), v))
   , ("complement" , {-# SCC "Prelude::complement" #-}
                     unary  (logicUnary complement (unaryBV complement)))
   , ("<<"         , {-# SCC "Prelude::(<<)" #-}
-                    logicShift shiftLW shiftLS)
+                    logicShift shiftLW shiftLB shiftLS)
   , (">>"         , {-# SCC "Prelude::(>>)" #-}
-                    logicShift shiftRW shiftRS)
+                    logicShift shiftRW shiftRB shiftRS)
   , ("<<<"        , {-# SCC "Prelude::(<<<)" #-}
-                    logicShift rotateLW rotateLS)
+                    logicShift rotateLW rotateLB rotateLS)
   , (">>>"        , {-# SCC "Prelude::(>>>)" #-}
-                    logicShift rotateRW rotateRS)
+                    logicShift rotateRW rotateRB rotateRS)
   , ("True"       , VBit True)
   , ("False"      , VBit False)
 
@@ -647,8 +649,17 @@ joinWordVal :: BitWord b w =>
 joinWordVal (WordVal w1) (WordVal w2)
   | wordLen w1 + wordLen w2 < largeBitSize
   = WordVal $ joinWord w1 w2
+joinWordVal (BitsVal xs) (WordVal w2)
+  | toInteger (Seq.length xs) + wordLen w2 < largeBitSize
+  = BitsVal (xs Seq.>< Seq.fromList (map ready $ unpackWord w2))
+joinWordVal (WordVal w1) (BitsVal ys)
+  | wordLen w1 + toInteger (Seq.length ys) < largeBitSize
+  = BitsVal (Seq.fromList (map ready $ unpackWord w1) Seq.>< ys)
+joinWordVal (BitsVal xs) (BitsVal ys)
+  | toInteger (Seq.length xs) + toInteger (Seq.length ys) < largeBitSize
+  = BitsVal (xs Seq.>< ys)
 joinWordVal w1 w2
-  = BitsVal (n1+n2) (concatSeqMap n1 (asBitsMap w1) (asBitsMap w2))
+  = LargeBitsVal (n1+n2) (concatSeqMap n1 (asBitsMap w1) (asBitsMap w2))
  where n1 = wordValueSize w1
        n2 = wordValueSize w2
 
@@ -691,7 +702,7 @@ joinSeq (Nat parts) each TVBit xs
                   do let (q,r) = divMod i each
                      ys <- fromWordVal "join seq" =<< lookupSeqMap xs q
                      VBit <$> indexWordValue ys (fromInteger r)
-       return $ VWord (parts * each) $ ready $ BitsVal (parts * each) zs
+       return $ VWord (parts * each) $ ready $ LargeBitsVal (parts * each) zs
 
 -- infinite sequence of words
 joinSeq Inf each TVBit xs
@@ -731,9 +742,12 @@ splitWordVal :: BitWord b w
 splitWordVal leftWidth rightWidth (WordVal w) =
   let (lw, rw) = splitWord leftWidth rightWidth w
    in (WordVal lw, WordVal rw)
-splitWordVal leftWidth rightWidth (BitsVal _n xs) =
+splitWordVal leftWidth _rightWidth (BitsVal bs) =
+  let (lbs, rbs) = Seq.splitAt (fromInteger leftWidth) bs
+   in (BitsVal lbs, BitsVal rbs)
+splitWordVal leftWidth rightWidth (LargeBitsVal _n xs) =
   let (lxs, rxs) = splitSeqMap leftWidth xs
-   in (BitsVal leftWidth lxs, BitsVal rightWidth rxs)
+   in (LargeBitsVal leftWidth lxs, LargeBitsVal rightWidth rxs)
 
 splitAtV :: BitWord b w
          => Nat'
@@ -753,9 +767,11 @@ splitAtV front back a val =
 
     Inf | aBit -> do
        vs <- delay Nothing (fromSeq "splitAtV" val)
-       ls <- delay Nothing (fst . splitSeqMap leftWidth <$> vs)
+       ls <- delay Nothing (do m <- fst . splitSeqMap leftWidth <$> vs
+                               let ms = map (fromVBit <$>) (enumerateSeqMap leftWidth m)
+                               return $ Seq.fromList $ ms)
        rs <- delay Nothing (snd . splitSeqMap leftWidth <$> vs)
-       return $ VTuple [ return $ VWord leftWidth (BitsVal leftWidth <$> ls)
+       return $ VTuple [ return $ VWord leftWidth (BitsVal <$> ls)
                        , VStream <$> rs
                        ]
 
@@ -789,9 +805,12 @@ extractWordVal :: BitWord b w
                -> WordValue b w
 extractWordVal len start (WordVal w) =
    WordVal $ extractWord len start w
-extractWordVal len start (BitsVal n xs) =
+extractWordVal len start (BitsVal bs) =
+   BitsVal $ Seq.take (fromInteger len) $
+     Seq.drop (Seq.length bs - fromInteger start - fromInteger len) bs
+extractWordVal len start (LargeBitsVal n xs) =
    let xs' = dropSeqMap (n - start - len) xs
-    in BitsVal len xs'
+    in LargeBitsVal len xs'
 
 
 -- | Split implementation.
@@ -810,11 +829,11 @@ ecSplitV =
        (Inf, Nat e) | isTBit a -> do
           val' <- delay Nothing (fromSeq "ecSplitV" =<< val)
           return $ VStream $ IndexSeqMap $ \i ->
-            return $ VWord e $ return $ BitsVal e $ IndexSeqMap $ \j ->
+            return $ VWord e $ return $ BitsVal $ Seq.fromFunction (fromInteger e) $ \j ->
               let idx = i*e + toInteger j
                in idx `seq` do
                       xs <- val'
-                      lookupSeqMap xs idx
+                      fromVBit <$> lookupSeqMap xs idx
        (Nat p, Nat e) -> do
           val' <- delay Nothing (fromSeq "ecSplitV" =<< val)
           return $ VSeq p $ IndexSeqMap $ \i ->
@@ -838,8 +857,9 @@ reverseV (VSeq n xs) =
   return $ VSeq n $ reverseSeqMap n xs
 reverseV (VWord n wv) = return (VWord n (revword <$> wv))
  where
- revword w = BitsVal m (reverseSeqMap m (asBitsMap w))
-   where m = wordValueSize w
+ revword (WordVal w)         = BitsVal $ Seq.reverse $ Seq.fromList $ map ready $ unpackWord w
+ revword (BitsVal bs)        = BitsVal $ Seq.reverse bs
+ revword (LargeBitsVal m xs) = LargeBitsVal m $ reverseSeqMap m xs
 reverseV _ =
   evalPanic "reverseV" ["Not a finite sequence"]
 
@@ -853,12 +873,12 @@ transposeV :: BitWord b w
 transposeV a b c xs
   | isTBit c, Nat na <- a = -- Fin a => [a][b]Bit -> [b][a]Bit
       return $ bseq $ IndexSeqMap $ \bi ->
-        return $ VWord na $ return $ BitsVal na $
-          IndexSeqMap $ \ai -> do
+        return $ VWord na $ return $ BitsVal $
+          Seq.fromFunction (fromInteger na) $ \ai -> do
             ys <- flip lookupSeqMap (toInteger ai) =<< fromSeq "transposeV" xs
             case ys of
-              VStream ys' -> lookupSeqMap ys' bi
-              VWord _ wv  -> VBit <$> (flip indexWordValue bi =<< wv)
+              VStream ys' -> fromVBit <$> lookupSeqMap ys' bi
+              VWord _ wv  -> flip indexWordValue bi =<< wv
               _ -> evalPanic "transpose" ["expected sequence of bits"]
 
   | isTBit c, Inf <- a = -- [inf][b]Bit -> [b][inf]Bit
@@ -928,7 +948,13 @@ wordValLogicOp :: BitWord b w
                -> WordValue b w
                -> WordValue b w
 wordValLogicOp _ wop (WordVal w1) (WordVal w2) = WordVal (wop w1 w2)
-wordValLogicOp bop _ w1 w2 = BitsVal (wordValueSize w1) zs
+wordValLogicOp bop _ (BitsVal xs) (BitsVal ys) =
+  BitsVal $ Seq.zipWith (\x y -> bop <$> x <*> y) xs ys
+wordValLogicOp bop _ (WordVal w1) (BitsVal ys) =
+  BitsVal $ Seq.zipWith (\x y -> bop <$> x <*> y) (Seq.fromList $ map ready $ unpackWord w1) ys
+wordValLogicOp bop _ (BitsVal xs) (WordVal w2) =
+  BitsVal $ Seq.zipWith (\x y -> bop <$> x <*> y) xs (Seq.fromList $ map ready $ unpackWord w2)
+wordValLogicOp bop _ w1 w2 = LargeBitsVal (wordValueSize w1) zs
      where zs = IndexSeqMap $ \i -> VBit <$> (bop <$> (fromBit =<< lookupSeqMap xs i) <*> (fromBit =<< lookupSeqMap ys i))
            xs = asBitsMap w1
            ys = asBitsMap w2
@@ -998,7 +1024,8 @@ wordValUnaryOp :: BitWord b w
                -> WordValue b w
                -> Eval (WordValue b w)
 wordValUnaryOp _ wop (WordVal w)  = return $ WordVal (wop w)
-wordValUnaryOp bop _ (BitsVal n xs) = BitsVal n <$> mapSeqMap f xs
+wordValUnaryOp bop _ (BitsVal bs) = return $ BitsVal (fmap (bop <$>) bs)
+wordValUnaryOp bop _ (LargeBitsVal n xs) = LargeBitsVal n <$> mapSeqMap f xs
   where f x = VBit . bop <$> fromBit x
 
 logicUnary :: forall b w
@@ -1047,9 +1074,10 @@ logicUnary opb opw = loop
 logicShift :: (Integer -> Integer -> Integer -> Integer)
               -- ^ The function may assume its arguments are masked.
               -- It is responsible for masking its result if needed.
+           -> (Integer -> Seq.Seq (Eval Bool) -> Integer -> Seq.Seq (Eval Bool))
            -> (Nat' -> TValue -> SeqValMap -> Integer -> SeqValMap)
            -> Value
-logicShift opW opS
+logicShift opW obB opS
   = nlam $ \ a ->
     nlam $ \ _ ->
     tlam $ \ c ->
@@ -1059,7 +1087,8 @@ logicShift opW opS
         l >>= \case
           VWord w wv -> return $ VWord w $ wv >>= \case
                           WordVal (BV _ x) -> return $ WordVal (BV w (opW w x i))
-                          BitsVal n xs -> return $ BitsVal n $ opS (Nat n) c xs i
+                          BitsVal bs -> return $ BitsVal (obB w bs i)
+                          LargeBitsVal n xs -> return $ LargeBitsVal n $ opS (Nat n) c xs i
 
           _ -> mkSeq a c <$> (opS a c <$> (fromSeq "logicShift" =<< l) <*> return i)
 
@@ -1068,6 +1097,12 @@ shiftLW :: Integer -> Integer -> Integer -> Integer
 shiftLW w ival by
   | by >= w   = 0
   | otherwise = mask w (shiftL ival (fromInteger by))
+
+shiftLB :: Integer -> Seq.Seq (Eval Bool) -> Integer -> Seq.Seq (Eval Bool)
+shiftLB w bs by =
+  Seq.drop (fromInteger (min w by)) bs
+  Seq.><
+  Seq.replicate (fromInteger (min w by)) (ready False)
 
 shiftLS :: Nat' -> TValue -> SeqValMap -> Integer -> SeqValMap
 shiftLS w ety vs by = IndexSeqMap $ \i ->
@@ -1082,6 +1117,12 @@ shiftRW :: Integer -> Integer -> Integer -> Integer
 shiftRW w i by
   | by >= w   = 0
   | otherwise = shiftR i (fromInteger by)
+
+shiftRB :: Integer -> Seq.Seq (Eval Bool) -> Integer -> Seq.Seq (Eval Bool)
+shiftRB w bs by =
+  Seq.replicate (fromInteger (min w by)) (ready False)
+  Seq.><
+  Seq.take (fromInteger (w - min w by)) bs
 
 shiftRS :: Nat' -> TValue -> SeqValMap -> Integer -> SeqValMap
 shiftRS w ety vs by = IndexSeqMap $ \i ->
@@ -1101,6 +1142,11 @@ rotateLW 0 i _  = i
 rotateLW w i by = mask w $ (i `shiftL` b) .|. (i `shiftR` (fromInteger w - b))
   where b = fromInteger (by `mod` w)
 
+rotateLB :: Integer -> Seq.Seq (Eval Bool) -> Integer -> Seq.Seq (Eval Bool)
+rotateLB w bs by =
+  let (hd,tl) = Seq.splitAt (fromInteger (by `mod` w)) bs
+   in tl Seq.>< hd
+
 rotateLS :: Nat' -> TValue -> SeqValMap -> Integer -> SeqValMap
 rotateLS w _ vs by = IndexSeqMap $ \i ->
   case w of
@@ -1113,6 +1159,11 @@ rotateRW 0 i _  = i
 rotateRW w i by = mask w $ (i `shiftR` b) .|. (i `shiftL` (fromInteger w - b))
   where b = fromInteger (by `mod` w)
 
+rotateRB :: Integer -> Seq.Seq (Eval Bool) -> Integer -> Seq.Seq (Eval Bool)
+rotateRB w bs by =
+  let (hd,tl) = Seq.splitAt (fromInteger (w - (by `mod` w))) bs
+   in tl Seq.>< hd
+
 rotateRS :: Nat' -> TValue -> SeqValMap -> Integer -> SeqValMap
 rotateRS w _ vs by = IndexSeqMap $ \i ->
   case w of
@@ -1124,7 +1175,7 @@ rotateRS w _ vs by = IndexSeqMap $ \i ->
 
 -- | Indexing operations that return one element.
 indexPrimOne :: BitWord b w
-             => (Maybe Integer -> TValue -> SeqMap b w -> [b] -> Eval (GenValue b w))
+             => (Maybe Integer -> TValue -> SeqMap b w -> Seq.Seq b -> Eval (GenValue b w))
              -> (Maybe Integer -> TValue -> SeqMap b w -> w -> Eval (GenValue b w))
              -> GenValue b w
 indexPrimOne bits_op word_op =
@@ -1141,7 +1192,8 @@ indexPrimOne bits_op word_op =
       r >>= \case
          VWord _ w -> w >>= \case
            WordVal w' -> word_op (fromNat n) a vs w'
-           BitsVal m xs -> bits_op (fromNat n) a vs =<< traverse (fromBit =<<) (enumerateSeqMap m xs)
+           BitsVal bs -> bits_op (fromNat n) a vs =<< sequence bs
+           LargeBitsVal m xs -> bits_op (fromNat n) a vs . Seq.fromList =<< traverse (fromBit =<<) (enumerateSeqMap m xs)
          _ -> evalPanic "Expected word value" ["indexPrimOne"]
 
 indexFront :: Maybe Integer -> TValue -> SeqValMap -> BV -> Eval Value
@@ -1150,8 +1202,8 @@ indexFront mblen _a vs (bvVal -> ix) =
     Just len | len <= ix -> invalidIndex ix
     _                    -> lookupSeqMap vs ix
 
-indexFront_bits :: Maybe Integer -> TValue -> SeqValMap -> [Bool] -> Eval Value
-indexFront_bits mblen a vs = indexFront mblen a vs . packWord
+indexFront_bits :: Maybe Integer -> TValue -> SeqValMap -> Seq.Seq Bool -> Eval Value
+indexFront_bits mblen a vs = indexFront mblen a vs . packWord . Fold.toList
 
 indexBack :: Maybe Integer -> TValue -> SeqValMap -> BV -> Eval Value
 indexBack mblen _a vs (bvVal -> ix) =
@@ -1161,12 +1213,12 @@ indexBack mblen _a vs (bvVal -> ix) =
     Nothing              -> evalPanic "indexBack"
                             ["unexpected infinite sequence"]
 
-indexBack_bits :: Maybe Integer -> TValue -> SeqValMap -> [Bool] -> Eval Value
-indexBack_bits mblen a vs = indexBack mblen a vs . packWord
+indexBack_bits :: Maybe Integer -> TValue -> SeqValMap -> Seq.Seq Bool -> Eval Value
+indexBack_bits mblen a vs = indexBack mblen a vs . packWord . Fold.toList
 
 -- | Indexing operations that return many elements.
 indexPrimMany :: BitWord b w
-              => (Maybe Integer -> TValue -> SeqMap b w -> [b] -> Eval (GenValue b w))
+              => (Maybe Integer -> TValue -> SeqMap b w -> Seq.Seq b -> Eval (GenValue b w))
               -> (Maybe Integer -> TValue -> SeqMap b w -> w -> Eval (GenValue b w))
               -> GenValue b w
 indexPrimMany bits_op word_op =
@@ -1186,7 +1238,8 @@ indexPrimMany bits_op word_op =
        lookupSeqMap ixs i >>= \case
          VWord _ w -> w >>= \case
             WordVal w' -> word_op (fromNat n) a vs w'
-            BitsVal o xs -> bits_op (fromNat n) a vs =<< traverse (fromBit =<<) (enumerateSeqMap o xs)
+            BitsVal bs -> bits_op (fromNat n) a vs =<< sequence bs
+            LargeBitsVal o xs -> bits_op (fromNat n) a vs . Seq.fromList =<< traverse (fromBit =<<) (enumerateSeqMap o xs)
          _ -> evalPanic "Expected word value" ["indexPrimMany"])
 
 
@@ -1374,7 +1427,8 @@ errorV ty msg = case ty of
 
   -- sequences
   TVSeq w ety
-     | isTBit ety -> return $ VWord w $ return $ BitsVal w $ IndexSeqMap $ \_ -> cryUserError msg
+     | isTBit ety -> return $ VWord w $ return $ BitsVal $
+                         Seq.replicate (fromInteger w) (cryUserError msg)
      | otherwise  -> return $ VSeq w (IndexSeqMap $ \_ -> errorV ety msg)
 
   TVStream ety ->
